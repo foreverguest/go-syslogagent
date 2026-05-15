@@ -76,7 +76,7 @@ func StartEventLogPoller(logNames []string, intervalSeconds int, server string) 
 					}
 					Debug("Found event %s from %s at %s: %s", e.Unique, logName, e.Time.Format(time.RFC3339), singleLine(e.Message))
 					// schedule aggregation and eventual send
-					addPendingAndSchedule(e.Unique, e.Message, e.Time, e.Provider, e.Computer, server)
+					addPendingAndSchedule(e.Unique, e.Message, e.Time, e.Provider, e.Computer, e.Level, e.Channel, e.EventID, e.EventData, server)
 					if e.Time.After(newest) {
 						newest = e.Time
 					}
@@ -95,21 +95,29 @@ func StartEventLogPoller(logNames []string, intervalSeconds int, server string) 
 }
 
 type wevtEntry struct {
-	Time     time.Time
-	Computer string
-	Provider string
-	Message  string
-	Unique   string // logName:EventRecordID
-	LogName  string
+	Time      time.Time
+	Computer  string
+	Provider  string
+	Message   string
+	Unique    string // logName:EventRecordID
+	LogName   string
+	EventID   string
+	Level     string
+	Channel   string
+	EventData map[string]interface{} // extracted from EventData XML
 }
 
 // aggregator to collect partitioned messages for same EventRecordID
 type pendingEntry struct {
-	parts    []string
-	timer    *time.Timer
-	firstTS  time.Time
-	provider string
-	computer string
+	parts     []string
+	timer     *time.Timer
+	firstTS   time.Time
+	provider  string
+	computer  string
+	level     string
+	channel   string
+	eventID   string
+	eventData map[string]interface{}
 }
 
 var (
@@ -126,11 +134,11 @@ const processedRetention = 2 * time.Hour
 // (no periodic cleanup timer: cleanup is performed before saving)
 const saveDebounceInterval = 5 * time.Second
 
-func addPendingAndSchedule(unique, part string, ts time.Time, provider, computer, server string) {
+func addPendingAndSchedule(unique, part string, ts time.Time, provider, computer, level, channel, eventID string, eventData map[string]interface{}, server string) {
 	pendingMu.Lock()
 	pe, ok := pending[unique]
 	if !ok {
-		pe = &pendingEntry{parts: []string{}, firstTS: ts, provider: provider, computer: computer}
+		pe = &pendingEntry{parts: []string{}, firstTS: ts, provider: provider, computer: computer, level: level, channel: channel, eventID: eventID, eventData: eventData}
 		pending[unique] = pe
 	}
 	pe.parts = append(pe.parts, part)
@@ -196,7 +204,7 @@ func flushPending(unique string, server string) {
 	// combine parts with a space
 	combined := strings.Join(pe.parts, " ")
 	// build a wevtEntry-like object to reuse buildSyslogFromEvent
-	e := wevtEntry{Message: combined, Time: pe.firstTS, Provider: pe.provider, Computer: pe.computer, LogName: ""}
+	e := wevtEntry{Message: combined, Time: pe.firstTS, Provider: pe.provider, Computer: pe.computer, LogName: "", Level: pe.level, Channel: pe.channel, EventID: pe.eventID, EventData: pe.eventData}
 	// unique is formatted as logName:EventRecordID
 	if before, _, ok0 := strings.Cut(unique, ":"); ok0 {
 		e.LogName = before
@@ -215,18 +223,24 @@ func parseWevtutilOutputXML(out []byte, logName string) []wevtEntry {
 		Provider struct {
 			Name string `xml:"Name,attr"`
 		} `xml:"Provider"`
+		EventID       string      `xml:"EventID"`
+		Level         string      `xml:"Level"`
 		TimeCreated   TimeCreated `xml:"TimeCreated"`
+		Channel       string      `xml:"Channel"`
 		Computer      string      `xml:"Computer"`
 		EventRecordID struct {
 			ID string `xml:",chardata"`
 		} `xml:"EventRecordID"`
 	}
 	type Event struct {
-		XMLName       xml.Name `xml:"Event"`
-		System        System   `xml:"System"`
-		RenderingInfo struct {
-			Message string `xml:"Message" xml:",innerxml"`
-		} `xml:"RenderingInfo"`
+		XMLName   xml.Name `xml:"Event"`
+		System    System   `xml:"System"`
+		EventData struct {
+			Data []struct {
+				Name string `xml:"Name,attr"`
+				Text string `xml:",chardata"`
+			} `xml:"Data"`
+		} `xml:"EventData"`
 	}
 
 	s := string(out)
@@ -248,8 +262,10 @@ func parseWevtutilOutputXML(out []byte, logName string) []wevtEntry {
 
 		var ev Event
 		if err := xml.Unmarshal([]byte(block), &ev); err == nil {
+			Debug("event unmarshal: %s", ev)
 			var e wevtEntry
 			e.Provider = ev.System.Provider.Name
+			e.Channel = logName
 			// parse time (try multiple layouts)
 			ts := strings.TrimSpace(ev.System.TimeCreated.SystemTime)
 			if ts != "" {
@@ -270,35 +286,29 @@ func parseWevtutilOutputXML(out []byte, logName string) []wevtEntry {
 				e.Time = time.Now()
 			}
 			e.Computer = ev.System.Computer
-			// try rendered message first
-			msg := strings.TrimSpace(ev.RenderingInfo.Message)
-			// if empty, try extracting inner RenderingInfo text from raw block
-			if msg == "" {
-				// find RenderingInfo block in raw XML
-				rsi := strings.Index(block, "<RenderingInfo")
-				if rsi != -1 {
-					rei := strings.Index(block[rsi:], "</RenderingInfo>")
-					if rei != -1 {
-						rei += rsi + len("</RenderingInfo>")
-						riBlock := block[rsi:rei]
-						// strip tags to get plain text
-						re := regexp.MustCompile(`<[^>]+>`)
-						stripped := re.ReplaceAllString(riBlock, " ")
-						msg = strings.TrimSpace(html.UnescapeString(stripped))
-					}
+			// extract EventID and Level
+			e.EventID = strings.TrimSpace(ev.System.EventID)
+			e.Level = strings.TrimSpace(ev.System.Level)
+			e.Channel = strings.TrimSpace(ev.System.Channel)
+			// extract EventData fields into map
+			e.EventData = make(map[string]interface{})
+			for _, data := range ev.EventData.Data {
+				if data.Name != "" {
+					e.EventData[data.Name] = data.Text
 				}
 			}
-			// fallback: whole block
-			if msg == "" {
+			// use EventData as message or fallback to empty
+			msg := ""
+			if len(e.EventData) == 0 {
+				// fallback: extract raw text from block
 				re := regexp.MustCompile(`<[^>]+>`)
 				stripped := re.ReplaceAllString(block, " ")
 				msg = strings.TrimSpace(html.UnescapeString(stripped))
 			}
 			e.Message = msg
 			// unique id: prefer EventRecordID when present, otherwise group by provider+time+computer
-			id := strings.TrimSpace(ev.System.EventRecordID.ID)
-			if id != "" {
-				e.Unique = fmt.Sprintf("%s:%s", logName, id)
+			if e.EventID != "" {
+				e.Unique = fmt.Sprintf("%s:%s", logName, e.EventID)
 			} else {
 				e.Unique = fmt.Sprintf("%s:%s:%s:%s", logName, strings.TrimSpace(ev.System.Provider.Name), ts, strings.TrimSpace(ev.System.Computer))
 			}
@@ -317,19 +327,34 @@ func buildSyslogFromEvent(e wevtEntry) string {
 	if !e.Time.IsZero() {
 		ts = e.Time.Format("Jan 2 15:04:05")
 	}
-	// host := e.Computer
-	// if host == "" {
-	// 	host = localHost
-	// }
 	host := localHost
 
 	proc := e.Provider
 	if proc == "" {
 		proc = "eventlog"
 	}
-	// ensure single-line values
-	proc = singleLine(sanitizeForSyslog(proc))
-	//logname := singleLine(sanitizeForSyslog(e.LogName))
+
+	payload := map[string]any{
+		"timestamp": e.Time.Format(time.RFC3339),
+		"host":      host,
+		"provider":  proc,
+		"log_name":  e.LogName,
+		"channel":   e.Channel,
+		"computer":  e.Computer,
+		"event_id":  e.EventID,
+		"level":     e.Level,
+		"message":   e.Message,
+		"unique":    e.Unique,
+	}
+	// add EventData fields dynamically
+	if len(e.EventData) > 0 {
+		payload["data"] = e.EventData
+	}
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		jsonBody = []byte(`{"error":"failed to encode event as json"}`)
+	}
+
 	pri := 134
 	msg := strings.Builder{}
 	msg.WriteString("<")
@@ -339,15 +364,9 @@ func buildSyslogFromEvent(e wevtEntry) string {
 	msg.WriteString(" ")
 	msg.WriteString(host)
 	msg.WriteString(" ")
-	// if logname != "" {
-	// 	msg.WriteString("log=")
-	// 	msg.WriteString(logname)
-	// 	msg.WriteString(" ")
-	// }
 	msg.WriteString(proc)
 	msg.WriteString("[info] ")
-	// message should be single-line
-	msg.WriteString(singleLine(sanitizeForSyslog(e.Message)))
+	msg.WriteString(string(jsonBody))
 	return msg.String()
 }
 
